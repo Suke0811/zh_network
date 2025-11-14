@@ -17,8 +17,9 @@
 #include "esp_mac.h"
 #endif
 
+#ifndef ZH_NETWORK_MAX_MESSAGE_SIZE
 #define ZH_NETWORK_MAX_MESSAGE_SIZE 218 // Maximum value of the transmitted data size. @attention All devices on the network must have the same ZH_NETWORK_MAX_MESSAGE_SIZE.
-
+#endif
 #define ZH_NETWORK_INIT_CONFIG_DEFAULT() \
     {                                    \
         .network_id = 0xFAFBFCFD,        \
