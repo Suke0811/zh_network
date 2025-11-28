@@ -11,6 +11,59 @@ static void _recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 static void _recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len);
 #endif
 static void _processing(void *pvParameter);
+
+static const char *TAG = "zh_network";
+
+static EventGroupHandle_t _event_group_handle = {0};
+static QueueHandle_t _queue_handle = {0};
+static TaskHandle_t _processing_task_handle = {0};
+static SemaphoreHandle_t _id_vector_mutex = {0};
+static zh_network_init_config_t _init_config = {0};
+static zh_vector_t _id_vector = {0};
+static zh_vector_t _route_vector = {0};
+static zh_vector_t _response_vector = {0};
+static uint8_t _self_mac[6] = {0};
+static const uint8_t _broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static bool _is_initialized = false;
+static uint8_t _attempts = 0;
+
+typedef struct
+{
+    uint8_t original_target_mac[6];
+    uint8_t intermediate_target_mac[6];
+} _routing_table_t;
+
+typedef struct
+{
+    uint64_t time;
+    enum
+    {
+        TO_SEND,
+        ON_RECV,
+        WAIT_ROUTE,
+        WAIT_RESPONSE,
+    } id;
+    struct
+    {
+        enum
+        {
+            BROADCAST,
+            UNICAST,
+            DELIVERY_CONFIRM,
+            SEARCH_REQUEST,
+            SEARCH_RESPONSE
+        } __attribute__((packed)) message_type;
+        uint32_t network_id;
+        uint32_t message_id;
+        uint32_t confirm_id;
+        uint8_t original_target_mac[6];
+        uint8_t original_sender_mac[6];
+        uint8_t sender_mac[6];
+        uint8_t payload[ZH_NETWORK_MAX_MESSAGE_SIZE];
+        uint8_t payload_len;
+    } __attribute__((packed)) data;
+} _queue_t;
+
 // RX worker components (allocation-free callback pattern)
 #define ZH_RX_MAX    (sizeof(_queue_t) - 14)
 #define ZH_RX_POOL   8
@@ -122,58 +175,6 @@ static void _rx_worker_task(void *arg)
         }
     }
 }
-
-static const char *TAG = "zh_network";
-
-static EventGroupHandle_t _event_group_handle = {0};
-static QueueHandle_t _queue_handle = {0};
-static TaskHandle_t _processing_task_handle = {0};
-static SemaphoreHandle_t _id_vector_mutex = {0};
-static zh_network_init_config_t _init_config = {0};
-static zh_vector_t _id_vector = {0};
-static zh_vector_t _route_vector = {0};
-static zh_vector_t _response_vector = {0};
-static uint8_t _self_mac[6] = {0};
-static const uint8_t _broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static bool _is_initialized = false;
-static uint8_t _attempts = 0;
-
-typedef struct
-{
-    uint8_t original_target_mac[6];
-    uint8_t intermediate_target_mac[6];
-} _routing_table_t;
-
-typedef struct
-{
-    uint64_t time;
-    enum
-    {
-        TO_SEND,
-        ON_RECV,
-        WAIT_ROUTE,
-        WAIT_RESPONSE,
-    } id;
-    struct
-    {
-        enum
-        {
-            BROADCAST,
-            UNICAST,
-            DELIVERY_CONFIRM,
-            SEARCH_REQUEST,
-            SEARCH_RESPONSE
-        } __attribute__((packed)) message_type;
-        uint32_t network_id;
-        uint32_t message_id;
-        uint32_t confirm_id;
-        uint8_t original_target_mac[6];
-        uint8_t original_sender_mac[6];
-        uint8_t sender_mac[6];
-        uint8_t payload[ZH_NETWORK_MAX_MESSAGE_SIZE];
-        uint8_t payload_len;
-    } __attribute__((packed)) data;
-} _queue_t;
 
 ESP_EVENT_DEFINE_BASE(ZH_NETWORK);
 
