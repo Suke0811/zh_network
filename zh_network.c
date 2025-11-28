@@ -11,6 +11,117 @@ static void _recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 static void _recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len);
 #endif
 static void _processing(void *pvParameter);
+// RX worker components (allocation-free callback pattern)
+#define ZH_RX_MAX    (sizeof(_queue_t) - 14)
+#define ZH_RX_POOL   8
+#define ZH_RXQ_LEN   16
+
+typedef struct {
+    uint8_t  data[ZH_RX_MAX];
+    uint16_t len;
+    uint8_t  src_mac[6];
+} _zh_rx_item_t;
+
+static _zh_rx_item_t _rx_pool[ZH_RX_POOL];
+static volatile uint32_t _rx_pool_bitmap; // 1 = free
+static QueueHandle_t _rx_queue_handle = {0};
+static TaskHandle_t _rx_worker_task_handle = {0};
+
+static inline int _rx_pool_alloc_idx(void)
+{
+    uint32_t m = _rx_pool_bitmap;
+    for (int i = 0; i < ZH_RX_POOL; ++i)
+    {
+        uint32_t bit = (1u << i);
+        if (m & bit)
+        {
+            if (__sync_bool_compare_and_swap(&_rx_pool_bitmap, m, m & ~bit))
+            {
+                return i;
+            }
+            m = _rx_pool_bitmap; // retry
+            i = -1; // restart loop after CAS race
+        }
+    }
+    return -1;
+}
+
+static inline void _rx_pool_free_idx(int i)
+{
+    if (i >= 0 && i < ZH_RX_POOL)
+    {
+        __sync_fetch_and_or(&_rx_pool_bitmap, (1u << i));
+    }
+}
+
+static void _rx_worker_task(void *arg)
+{
+    for (;;)
+    {
+        int idx = -1;
+        if (xQueueReceive(_rx_queue_handle, &idx, portMAX_DELAY) == pdTRUE)
+        {
+            if (idx < 0 || idx >= ZH_RX_POOL)
+            {
+                continue;
+            }
+            _zh_rx_item_t *it = &_rx_pool[idx];
+            // Build ON_RECV queue item and run heavy processing/logging here
+            if (it->len == (sizeof(_queue_t) - 14))
+            {
+                _queue_t q = {0};
+                q.id = ON_RECV;
+                memcpy(&q.data, it->data, it->len);
+                // Validate network id
+                if (memcmp(&q.data.network_id, &_init_config.network_id, sizeof(q.data.network_id)) == 0)
+                {
+                    // Duplicate check
+                    bool is_dup = false;
+                    for (uint16_t i = 0; i < zh_vector_get_size(&_id_vector); ++i)
+                    {
+                        uint32_t *message_id = zh_vector_get_item(&_id_vector, i);
+                        if (memcmp(&q.data.message_id, message_id, sizeof(q.data.message_id)) == 0)
+                        {
+                            is_dup = true;
+                            break;
+                        }
+                    }
+                    if (!is_dup)
+                    {
+                        if (xSemaphoreTake(_id_vector_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                        {
+                            zh_vector_push_back(&_id_vector, &q.data.message_id);
+                            if (zh_vector_get_size(&_id_vector) > _init_config.id_vector_size)
+                            {
+                                zh_vector_delete_item(&_id_vector, 0);
+                            }
+                            xSemaphoreGive(_id_vector_mutex);
+                        }
+                        memcpy(q.data.sender_mac, it->src_mac, 6);
+                        // Send to front so inbound messages are handled promptly as before
+                        if (xQueueSendToFront(_queue_handle, &q, portTICK_PERIOD_MS) != pdTRUE)
+                        {
+                            ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
+                        }
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "Incoming ESP-NOW data dropped. Repeat message received.");
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Incoming ESP-NOW data dropped. Incorrect mesh network ID.");
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Incoming ESP-NOW data dropped. Incorrect ESP-NOW data size.");
+            }
+            _rx_pool_free_idx(idx);
+        }
+    }
+}
 
 static const char *TAG = "zh_network";
 
@@ -111,11 +222,20 @@ esp_err_t zh_network_init(const zh_network_init_config_t *config)
     }
     _event_group_handle = xEventGroupCreate();
     _queue_handle = xQueueCreate(_init_config.queue_size, sizeof(_queue_t));
+    // Initialize RX pool/queue and worker
+    _rx_queue_handle = xQueueCreate(ZH_RXQ_LEN, sizeof(int));
+    _rx_pool_bitmap = (uint32_t)((1u << ZH_RX_POOL) - 1);
     zh_vector_init(&_id_vector, sizeof(uint32_t), false);
     zh_vector_init(&_route_vector, sizeof(_routing_table_t), false);
     zh_vector_init(&_response_vector, sizeof(uint32_t), false);
     _id_vector_mutex = xSemaphoreCreateMutex();
     if (esp_now_init() != ESP_OK || esp_now_register_send_cb(_send_cb) != ESP_OK || esp_now_register_recv_cb(_recv_cb) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "ESP-NOW initialization fail. Internal error.");
+        return ESP_FAIL;
+    }
+    // Worker task for processing incoming messages out of callback context
+    if (xTaskCreatePinnedToCore(&_rx_worker_task, "zh_rxw", 4096, NULL, configMAX_PRIORITIES - 2, &_rx_worker_task_handle, tskNO_AFFINITY) != pdPASS)
     {
         ESP_LOGE(TAG, "ESP-NOW initialization fail. Internal error.");
         return ESP_FAIL;
@@ -140,6 +260,16 @@ esp_err_t zh_network_deinit(void)
     }
     vEventGroupDelete(_event_group_handle);
     vQueueDelete(_queue_handle);
+    if (_rx_worker_task_handle)
+    {
+        vTaskDelete(_rx_worker_task_handle);
+        _rx_worker_task_handle = 0;
+    }
+    if (_rx_queue_handle)
+    {
+        vQueueDelete(_rx_queue_handle);
+        _rx_queue_handle = 0;
+    }
     esp_now_unregister_send_cb();
     esp_now_unregister_recv_cb();
     esp_now_deinit();
@@ -220,13 +350,13 @@ esp_err_t zh_network_send(const uint8_t *target, const uint8_t *data, const uint
 
 static void _send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
-    if (status == ESP_NOW_SEND_SUCCESS)
+    // Keep callback minimal and non-blocking
+    BaseType_t xHigherWoken = pdFALSE;
+    EventBits_t bits = (status == ESP_NOW_SEND_SUCCESS) ? DATA_SEND_SUCCESS : DATA_SEND_FAIL;
+    xEventGroupSetBitsFromISR(_event_group_handle, bits, &xHigherWoken);
+    if (xHigherWoken)
     {
-        xEventGroupSetBits(_event_group_handle, DATA_SEND_SUCCESS);
-    }
-    else
-    {
-        xEventGroupSetBits(_event_group_handle, DATA_SEND_FAIL);
+        portYIELD_FROM_ISR();
     }
 }
 
@@ -236,62 +366,40 @@ static void _recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 static void _recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
 #endif
 {
-#if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
-    ESP_LOGI(TAG, "Adding incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to queue begin.", MAC2STR(mac_addr));
-#else
-    ESP_LOGI(TAG, "Adding incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to queue begin.", MAC2STR(esp_now_info->src_addr));
-#endif
-    if (uxQueueSpacesAvailable(_queue_handle) < (_init_config.queue_size - 2))
+    // Minimal, allocation-free callback. Copy and enqueue descriptor only.
+    if (data == NULL || data_len <= 0 || data_len > ZH_RX_MAX)
     {
-        ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Queue is almost full.");
         return;
     }
-    if (data_len == sizeof(_queue_t) - 14)
+    int idx = _rx_pool_alloc_idx();
+    if (idx < 0)
     {
-        _queue_t queue = {0};
-        queue.id = ON_RECV;
-        memcpy(&queue.data, data, data_len);
-        if (memcmp(&queue.data.network_id, &_init_config.network_id, sizeof(queue.data.network_id)) != 0)
-        {
-            ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Incorrect mesh network ID.");
-            return;
-        }
-        for (uint16_t i = 0; i < zh_vector_get_size(&_id_vector); ++i)
-        {
-            uint32_t *message_id = zh_vector_get_item(&_id_vector, i);
-            if (memcmp(&queue.data.message_id, message_id, sizeof(queue.data.message_id)) == 0)
-            {
-                ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Repeat message received.");
-                return;
-            }
-        }
-        if (xSemaphoreTake(_id_vector_mutex, portTICK_PERIOD_MS) == pdTRUE)
-        {
-            zh_vector_push_back(&_id_vector, &queue.data.message_id);
-            if (zh_vector_get_size(&_id_vector) > _init_config.id_vector_size)
-            {
-                zh_vector_delete_item(&_id_vector, 0);
-            }
-            xSemaphoreGive(_id_vector_mutex);
-        }
-#if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
-        memcpy(queue.data.sender_mac, mac_addr, 6);
-#else
-        memcpy(queue.data.sender_mac, esp_now_info->src_addr, 6);
-#endif
-#if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
-        ESP_LOGI(TAG, "Adding incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to queue success.", MAC2STR(mac_addr));
-#else
-        ESP_LOGI(TAG, "Adding incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to queue success.", MAC2STR(esp_now_info->src_addr));
-#endif
-        if (xQueueSendToFront(_queue_handle, &queue, portTICK_PERIOD_MS) != pdTRUE)
-        {
-            ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
-        }
+        // Pool pressure, drop silently to protect Wi-Fi task
+        return;
     }
-    else
+    _zh_rx_item_t *it = &_rx_pool[idx];
+#if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
+    if (mac_addr == NULL)
     {
-        ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Incorrect ESP-NOW data size.");
+        _rx_pool_free_idx(idx);
+        return;
+    }
+    memcpy(it->src_mac, mac_addr, 6);
+#else
+    if (esp_now_info == NULL || esp_now_info->src_addr == NULL)
+    {
+        _rx_pool_free_idx(idx);
+        return;
+    }
+    memcpy(it->src_mac, esp_now_info->src_addr, 6);
+#endif
+    memcpy(it->data, data, (size_t)data_len);
+    it->len = (uint16_t)data_len;
+    BaseType_t xHigherWoken = pdFALSE;
+    xQueueSendFromISR(_rx_queue_handle, &idx, &xHigherWoken);
+    if (xHigherWoken)
+    {
+        portYIELD_FROM_ISR();
     }
 }
 
