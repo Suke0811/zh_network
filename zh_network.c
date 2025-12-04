@@ -480,10 +480,16 @@ static void _processing(void *pvParameter)
             // Set channel explicitly for unicast and attempt to add peer if not broadcast
             peer->channel = _init_config.wifi_channel;
             bool is_broadcast = (memcmp(peer->peer_addr, _broadcast_mac, 6) == 0);
+            bool peer_added_here = false;
+            bool broadcast_peer_added_here = false;
             if (!is_broadcast)
             {
                 esp_err_t _add_err = esp_now_add_peer(peer);
-                if (_add_err != ESP_OK && _add_err != ESP_ERR_ESPNOW_EXIST)
+                if (_add_err == ESP_OK)
+                {
+                    peer_added_here = true;
+                }
+                else if (_add_err != ESP_OK && _add_err != ESP_ERR_ESPNOW_EXIST)
                 {
                     ESP_LOGE(
                         TAG,
@@ -510,12 +516,35 @@ static void _processing(void *pvParameter)
             memcpy(on_send->mac_addr, queue.data.original_target_mac, 6);
         SEND:
             ++_attempts;
-            if (esp_now_send((uint8_t *)peer->peer_addr, (uint8_t *)&queue.data, sizeof(_queue_t) - 14) != ESP_OK)
+            esp_err_t _send_err = esp_now_send((uint8_t *)peer->peer_addr, (uint8_t *)&queue.data, sizeof(_queue_t) - 14);
+            if (_send_err != ESP_OK)
             {
-                ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
-                heap_caps_free(peer);
-                heap_caps_free(on_send);
-                break;
+                // If broadcast peer is not known on this IDF, add it and retry once
+                if (is_broadcast && _send_err == ESP_ERR_ESPNOW_NOT_FOUND)
+                {
+                    esp_err_t _add_b = esp_now_add_peer(peer);
+                    if (_add_b == ESP_OK)
+                    {
+                        broadcast_peer_added_here = true;
+                    }
+                    if (_add_b == ESP_OK || _add_b == ESP_ERR_ESPNOW_EXIST)
+                    {
+                        _send_err = esp_now_send((uint8_t *)peer->peer_addr, (uint8_t *)&queue.data, sizeof(_queue_t) - 14);
+                    }
+                }
+                if (_send_err != ESP_OK)
+                {
+                    ESP_LOGE(
+                        TAG,
+                        "esp_now_send fail: err=%d(%s) dst=%02X:%02X:%02X:%02X:%02X:%02X msg_type=%d",
+                        (int)_send_err,
+                        esp_err_to_name(_send_err),
+                        MAC2STR(peer->peer_addr),
+                        (int)queue.data.message_type);
+                    heap_caps_free(peer);
+                    heap_caps_free(on_send);
+                    break;
+                }
             }
             EventBits_t bit = xEventGroupWaitBits(_event_group_handle, DATA_SEND_SUCCESS | DATA_SEND_FAIL, pdTRUE, pdFALSE, 50 / portTICK_PERIOD_MS);
             if ((bit & DATA_SEND_SUCCESS) != 0)
@@ -703,9 +732,12 @@ static void _processing(void *pvParameter)
                     }
                 }
             }
-            esp_now_del_peer(peer->peer_addr);
-            heap_caps_free(on_send);
+            if (peer_added_here || broadcast_peer_added_here)
+            {
+                esp_now_del_peer(peer->peer_addr);
+            }
             heap_caps_free(peer);
+            heap_caps_free(on_send);
             break;
         case ON_RECV:
             ESP_LOGI(TAG, "Incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to MAC %02X:%02X:%02X:%02X:%02X:%02X processing begin.", MAC2STR(queue.data.original_sender_mac), MAC2STR(queue.data.original_target_mac));
