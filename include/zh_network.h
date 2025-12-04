@@ -1,6 +1,7 @@
 #pragma once
 
 #include "string.h"
+#include <stdbool.h>
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -20,18 +21,22 @@
 #ifndef ZH_NETWORK_MAX_MESSAGE_SIZE
 #define ZH_NETWORK_MAX_MESSAGE_SIZE 218 // Maximum value of the transmitted data size. @attention All devices on the network must have the same ZH_NETWORK_MAX_MESSAGE_SIZE.
 #endif
-#define ZH_NETWORK_INIT_CONFIG_DEFAULT() \
-    {                                    \
-        .network_id = 0xFAFBFCFD,        \
-        .task_priority = 4,              \
-        .stack_size = 3072,              \
-        .queue_size = 32,                \
-        .max_waiting_time = 1000,        \
-        .id_vector_size = 100,           \
-        .route_vector_size = 100,        \
-        .wifi_interface = WIFI_IF_STA,   \
-        .wifi_channel = 1,               \
-        .attempts = 3                    \
+#define ZH_NETWORK_INIT_CONFIG_DEFAULT()                 \
+    {                                                    \
+        .network_id = 0xFAFBFCFD,                       \
+        .task_priority = 4,                             \
+        .stack_size = 3072,                             \
+        .queue_size = 32,                               \
+        .max_waiting_time = 1000,                       \
+        .id_vector_size = 100,                          \
+        .route_vector_size = 100,                       \
+        .wifi_interface = WIFI_IF_STA,                  \
+        .wifi_channel = 1,                              \
+        .attempts = 3,                                  \
+        .enable_route_discovery = true,                 \
+        .search_req_global_interval_ms = 0,             \
+        .search_req_per_target_interval_ms = 0,         \
+        .search_req_max_inflight = 0                    \
     }
 
 #ifdef __cplusplus
@@ -51,6 +56,11 @@ extern "C"
         wifi_interface_t wifi_interface; // WiFi interface (STA or AP) used for ESP-NOW operation. @note The MAC address of the device depends on the selected WiFi interface.
         uint8_t wifi_channel;            // Wi-Fi channel uses to send/receive ESPNOW data. @note Values from 1 to 14.
         uint8_t attempts;                // Maximum number of attempts to send a message. @note It is not recommended to set a value greater than 5.
+        // Route discovery controls
+        bool     enable_route_discovery;            // Allow automatic SEARCH_REQUEST when route missing
+        uint32_t search_req_global_interval_ms;     // Minimum time between any two SEARCH_REQUESTs (0 = no limit)
+        uint32_t search_req_per_target_interval_ms; // Minimum time between SEARCH_REQUESTs for the same target (0 = no limit)
+        uint8_t  search_req_max_inflight;           // Cap number of SEARCH_REQUESTs concurrently queued/sent (0 = no cap)
     } zh_network_init_config_t;
 
     ESP_EVENT_DECLARE_BASE(ZH_NETWORK);

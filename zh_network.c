@@ -27,6 +27,39 @@ static const uint8_t _broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static bool _is_initialized = false;
 static uint8_t _attempts = 0;
 
+// --- Route discovery limiters state ---
+static uint32_t _last_search_req_ms = 0; // global limiter timestamp (ms)
+typedef struct
+{
+    uint8_t target_mac[6];
+    uint32_t last_ms; // last SEARCH_REQUEST timestamp for this target (ms)
+} _search_req_entry_t;
+static zh_vector_t _search_req_vector = {0};
+static SemaphoreHandle_t _search_req_mutex = {0};
+static uint8_t _search_req_inflight = 0; // number of SEARCH_REQUESTs in flight
+
+static inline uint32_t _now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static _search_req_entry_t *_get_search_entry(const uint8_t target[6])
+{
+    for (uint16_t i = 0; i < zh_vector_get_size(&_search_req_vector); ++i)
+    {
+        _search_req_entry_t *e = zh_vector_get_item(&_search_req_vector, i);
+        if (memcmp(e->target_mac, target, 6) == 0)
+        {
+            return e;
+        }
+    }
+    _search_req_entry_t e = {0};
+    memcpy(e.target_mac, target, 6);
+    e.last_ms = 0;
+    zh_vector_push_back(&_search_req_vector, &e);
+    return zh_vector_get_item(&_search_req_vector, zh_vector_get_size(&_search_req_vector) - 1);
+}
+
 typedef struct
 {
     uint8_t original_target_mac[6];
@@ -114,7 +147,9 @@ esp_err_t zh_network_init(const zh_network_init_config_t *config)
     zh_vector_init(&_id_vector, sizeof(uint32_t), false);
     zh_vector_init(&_route_vector, sizeof(_routing_table_t), false);
     zh_vector_init(&_response_vector, sizeof(uint32_t), false);
+    zh_vector_init(&_search_req_vector, sizeof(_search_req_entry_t), false);
     _id_vector_mutex = xSemaphoreCreateMutex();
+    _search_req_mutex = xSemaphoreCreateMutex();
     if (esp_now_init() != ESP_OK || esp_now_register_send_cb(_send_cb) != ESP_OK || esp_now_register_recv_cb(_recv_cb) != ESP_OK)
     {
         ESP_LOGE(TAG, "ESP-NOW initialization fail. Internal error.");
@@ -146,6 +181,7 @@ esp_err_t zh_network_deinit(void)
     zh_vector_free(&_id_vector);
     zh_vector_free(&_route_vector);
     zh_vector_free(&_response_vector);
+    zh_vector_free(&_search_req_vector);
     vTaskDelete(_processing_task_handle);
     _is_initialized = false;
     ESP_LOGI(TAG, "ESP-NOW deinitialization success.");
@@ -361,6 +397,57 @@ static void _processing(void *pvParameter)
                     {
                         ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
                     }
+                    // Config gate for route discovery
+                    if (_init_config.enable_route_discovery == false)
+                    {
+                        ESP_LOGW(TAG, "Route discovery disabled by config. SEARCH_REQUEST will not be queued.");
+                        heap_caps_free(peer);
+                        break;
+                    }
+
+                    bool allowed = true;
+                    uint32_t now = _now_ms();
+
+                    if (_init_config.search_req_global_interval_ms > 0)
+                    {
+                        if (now - _last_search_req_ms < _init_config.search_req_global_interval_ms)
+                        {
+                            allowed = false;
+                        }
+                    }
+
+                    if (allowed && _init_config.search_req_per_target_interval_ms > 0)
+                    {
+                        if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                        {
+                            _search_req_entry_t *ent = _get_search_entry(queue.data.original_target_mac);
+                            if (now - ent->last_ms < _init_config.search_req_per_target_interval_ms)
+                            {
+                                allowed = false;
+                            }
+                            xSemaphoreGive(_search_req_mutex);
+                        }
+                    }
+
+                    if (allowed && _init_config.search_req_max_inflight > 0)
+                    {
+                        if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                        {
+                            if (_search_req_inflight >= _init_config.search_req_max_inflight)
+                            {
+                                allowed = false;
+                            }
+                            xSemaphoreGive(_search_req_mutex);
+                        }
+                    }
+
+                    if (!allowed)
+                    {
+                        ESP_LOGW(TAG, "SEARCH_REQUEST suppressed by rate limit.");
+                        heap_caps_free(peer);
+                        break;
+                    }
+
                     ESP_LOGI(TAG, "System message for routing request from MAC %02X:%02X:%02X:%02X:%02X:%02X to MAC %02X:%02X:%02X:%02X:%02X:%02X added to queue.", MAC2STR(queue.data.original_sender_mac), MAC2STR(queue.data.original_target_mac));
                     queue.id = TO_SEND;
                     queue.data.message_type = SEARCH_REQUEST;
@@ -368,6 +455,19 @@ static void _processing(void *pvParameter)
                     queue.data.payload_len = 0;
                     memset(queue.data.payload, 0, ZH_NETWORK_MAX_MESSAGE_SIZE);
                     queue.data.message_id = abs(esp_random()); // It is not clear why esp_random() sometimes gives negative values.
+
+                    if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                    {
+                        _last_search_req_ms = now;
+                        _search_req_entry_t *ent = _get_search_entry(queue.data.original_target_mac);
+                        ent->last_ms = now;
+                        if (_init_config.search_req_max_inflight > 0 && _search_req_inflight < 255)
+                        {
+                            _search_req_inflight++;
+                        }
+                        xSemaphoreGive(_search_req_mutex);
+                    }
+
                     ESP_LOGI(TAG, "Outgoing ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to MAC %02X:%02X:%02X:%02X:%02X:%02X processed success.", MAC2STR(queue.data.original_sender_mac), MAC2STR(queue.data.original_target_mac));
                     if (xQueueSendToFront(_queue_handle, &queue, portTICK_PERIOD_MS) != pdTRUE)
                     {
@@ -377,21 +477,26 @@ static void _processing(void *pvParameter)
                     break;
                 }
             }
-            // Attempt to add peer and log detailed error information if it fails
-            esp_err_t _add_err = esp_now_add_peer(peer);
-            if (_add_err != ESP_OK)
+            // Set channel explicitly for unicast and attempt to add peer if not broadcast
+            peer->channel = _init_config.wifi_channel;
+            bool is_broadcast = (memcmp(peer->peer_addr, _broadcast_mac, 6) == 0);
+            if (!is_broadcast)
             {
-                ESP_LOGE(
-                    TAG,
-                    "Outgoing ESP-NOW data processing fail. add_peer err=%d(%s) target=%02X:%02X:%02X:%02X:%02X:%02X chan=%d if=%d.",
-                    (int)_add_err,
-                    esp_err_to_name(_add_err),
-                    MAC2STR(peer->peer_addr),
-                    (int)peer->channel,
-                    (int)peer->ifidx
-                );
-                heap_caps_free(peer);
-                break;
+                esp_err_t _add_err = esp_now_add_peer(peer);
+                if (_add_err != ESP_OK && _add_err != ESP_ERR_ESPNOW_EXIST)
+                {
+                    ESP_LOGE(
+                        TAG,
+                        "Outgoing ESP-NOW data processing fail. add_peer err=%d(%s) target=%02X:%02X:%02X:%02X:%02X:%02X chan=%d if=%d.",
+                        (int)_add_err,
+                        esp_err_to_name(_add_err),
+                        MAC2STR(peer->peer_addr),
+                        (int)peer->channel,
+                        (int)peer->ifidx
+                    );
+                    heap_caps_free(peer);
+                    break;
+                }
             }
             zh_network_event_on_send_t *on_send = heap_caps_malloc(sizeof(zh_network_event_on_send_t), MALLOC_CAP_8BIT);
             if (on_send == NULL)
@@ -416,6 +521,15 @@ static void _processing(void *pvParameter)
             if ((bit & DATA_SEND_SUCCESS) != 0)
             {
                 _attempts = 0;
+                if (queue.data.message_type == SEARCH_REQUEST && _init_config.search_req_max_inflight > 0)
+                {
+                    if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                    {
+                        if (_search_req_inflight > 0)
+                            _search_req_inflight--;
+                        xSemaphoreGive(_search_req_mutex);
+                    }
+                }
                 if (memcmp(queue.data.original_sender_mac, _self_mac, 6) == 0)
                 {
                     if (queue.data.message_type == BROADCAST)
@@ -492,6 +606,15 @@ static void _processing(void *pvParameter)
                     goto SEND;
                 }
                 _attempts = 0;
+                if (queue.data.message_type == SEARCH_REQUEST && _init_config.search_req_max_inflight > 0)
+                {
+                    if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                    {
+                        if (_search_req_inflight > 0)
+                            _search_req_inflight--;
+                        xSemaphoreGive(_search_req_mutex);
+                    }
+                }
                 if (memcmp(queue.data.original_target_mac, _broadcast_mac, 6) != 0)
                 {
                     ESP_LOGI(TAG, "Routing to MAC %02X:%02X:%02X:%02X:%02X:%02X via MAC %02X:%02X:%02X:%02X:%02X:%02X is incorrect.", MAC2STR(queue.data.original_target_mac), MAC2STR(peer->peer_addr));
@@ -517,17 +640,66 @@ static void _processing(void *pvParameter)
                     {
                         ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
                     }
-                    ESP_LOGI(TAG, "System message for routing request to MAC %02X:%02X:%02X:%02X:%02X:%02X added to queue.", MAC2STR(queue.data.original_target_mac));
-                    queue.id = TO_SEND;
-                    queue.data.message_type = SEARCH_REQUEST;
-                    memcpy(queue.data.original_sender_mac, _self_mac, 6);
-                    queue.data.payload_len = 0;
-                    memset(queue.data.payload, 0, ZH_NETWORK_MAX_MESSAGE_SIZE);
-                    queue.data.message_id = abs(esp_random()); // It is not clear why esp_random() sometimes gives negative values.
-                    ESP_LOGI(TAG, "Outgoing ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to MAC %02X:%02X:%02X:%02X:%02X:%02X processed success.", MAC2STR(queue.data.original_sender_mac), MAC2STR(queue.data.original_target_mac));
-                    if (xQueueSendToFront(_queue_handle, &queue, portTICK_PERIOD_MS) != pdTRUE)
+                    if (_init_config.enable_route_discovery)
                     {
-                        ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
+                        bool allowed2 = true;
+                        uint32_t now2 = _now_ms();
+                        if (_init_config.search_req_global_interval_ms > 0 && (now2 - _last_search_req_ms < _init_config.search_req_global_interval_ms))
+                        {
+                            allowed2 = false;
+                        }
+                        if (allowed2 && _init_config.search_req_per_target_interval_ms > 0)
+                        {
+                            if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                            {
+                                _search_req_entry_t *ent2 = _get_search_entry(queue.data.original_target_mac);
+                                if (now2 - ent2->last_ms < _init_config.search_req_per_target_interval_ms)
+                                {
+                                    allowed2 = false;
+                                }
+                                xSemaphoreGive(_search_req_mutex);
+                            }
+                        }
+                        if (allowed2 && _init_config.search_req_max_inflight > 0)
+                        {
+                            if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                            {
+                                if (_search_req_inflight >= _init_config.search_req_max_inflight)
+                                {
+                                    allowed2 = false;
+                                }
+                                xSemaphoreGive(_search_req_mutex);
+                            }
+                        }
+                        if (allowed2)
+                        {
+                            ESP_LOGI(TAG, "System message for routing request to MAC %02X:%02X:%02X:%02X:%02X:%02X added to queue.", MAC2STR(queue.data.original_target_mac));
+                            queue.id = TO_SEND;
+                            queue.data.message_type = SEARCH_REQUEST;
+                            memcpy(queue.data.original_sender_mac, _self_mac, 6);
+                            queue.data.payload_len = 0;
+                            memset(queue.data.payload, 0, ZH_NETWORK_MAX_MESSAGE_SIZE);
+                            queue.data.message_id = abs(esp_random());
+                            if (xSemaphoreTake(_search_req_mutex, portTICK_PERIOD_MS) == pdTRUE)
+                            {
+                                _last_search_req_ms = now2;
+                                _search_req_entry_t *ent2b = _get_search_entry(queue.data.original_target_mac);
+                                ent2b->last_ms = now2;
+                                if (_init_config.search_req_max_inflight > 0 && _search_req_inflight < 255)
+                                {
+                                    _search_req_inflight++;
+                                }
+                                xSemaphoreGive(_search_req_mutex);
+                            }
+                            if (xQueueSendToFront(_queue_handle, &queue, portTICK_PERIOD_MS) != pdTRUE)
+                            {
+                                ESP_LOGE(TAG, "ESP-NOW message processing task internal error at line %d.", __LINE__);
+                            }
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "SEARCH_REQUEST suppressed by rate limit.");
+                        }
                     }
                 }
             }
