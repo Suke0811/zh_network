@@ -377,9 +377,19 @@ static void _processing(void *pvParameter)
                     break;
                 }
             }
-            if (esp_now_add_peer(peer) != ESP_OK)
+            // Attempt to add peer and log detailed error information if it fails
+            esp_err_t _add_err = esp_now_add_peer(peer);
+            if (_add_err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Outgoing ESP-NOW data processing fail. Internal error with adding peer.");
+                ESP_LOGE(
+                    TAG,
+                    "Outgoing ESP-NOW data processing fail. add_peer err=%d(%s) target=%02X:%02X:%02X:%02X:%02X:%02X chan=%d if=%d.",
+                    (int)_add_err,
+                    esp_err_to_name(_add_err),
+                    MAC2STR(peer->peer_addr),
+                    (int)peer->channel,
+                    (int)peer->ifidx
+                );
                 heap_caps_free(peer);
                 break;
             }
