@@ -292,23 +292,33 @@ static void _recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *dat
             ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Incorrect mesh network ID.");
             return;
         }
-        for (uint16_t i = 0; i < zh_vector_get_size(&_id_vector); ++i)
-        {
-            uint32_t *message_id = zh_vector_get_item(&_id_vector, i);
-            if (memcmp(&queue.data.message_id, message_id, sizeof(queue.data.message_id)) == 0)
-            {
-                ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Repeat message received.");
-                return;
-            }
-        }
+        bool is_repeat = false;
         if (xSemaphoreTake(_id_vector_mutex, portTICK_PERIOD_MS) == pdTRUE)
         {
-            zh_vector_push_back(&_id_vector, &queue.data.message_id);
-            if (zh_vector_get_size(&_id_vector) > _init_config.id_vector_size)
+            for (uint16_t i = 0; i < zh_vector_get_size(&_id_vector); ++i)
             {
-                zh_vector_delete_item(&_id_vector, 0);
+                uint32_t *message_id = zh_vector_get_item(&_id_vector, i);
+                if (message_id != NULL &&
+                    memcmp(&queue.data.message_id, message_id, sizeof(queue.data.message_id)) == 0)
+                {
+                    is_repeat = true;
+                    break;
+                }
+            }
+            if (!is_repeat)
+            {
+                zh_vector_push_back(&_id_vector, &queue.data.message_id);
+                if (zh_vector_get_size(&_id_vector) > _init_config.id_vector_size)
+                {
+                    zh_vector_delete_item(&_id_vector, 0);
+                }
             }
             xSemaphoreGive(_id_vector_mutex);
+        }
+        if (is_repeat)
+        {
+            ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Repeat message received.");
+            return;
         }
 #if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
         memcpy(queue.data.sender_mac, mac_addr, 6);
