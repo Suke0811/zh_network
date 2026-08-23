@@ -4,7 +4,11 @@
 #define DATA_SEND_FAIL BIT1
 #define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
 
+#if (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR >= 5) || (ESP_IDF_VERSION_MAJOR > 5)
+static void _send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
+#else
 static void _send_cb(const uint8_t *mac_addr, esp_now_send_status_t status);
+#endif
 #if defined CONFIG_IDF_TARGET_ESP8266 || ESP_IDF_VERSION_MAJOR == 4
 static void _recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len);
 #else
@@ -218,7 +222,11 @@ esp_err_t zh_network_send(const uint8_t *target, const uint8_t *data, const uint
     return ESP_OK;
 }
 
+#if (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR >= 5) || (ESP_IDF_VERSION_MAJOR > 5)
+static void _send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
+#else
 static void _send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
+#endif
 {
     if (status == ESP_NOW_SEND_SUCCESS)
     {
@@ -241,7 +249,7 @@ static void _recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *dat
 #else
     ESP_LOGI(TAG, "Adding incoming ESP-NOW data from MAC %02X:%02X:%02X:%02X:%02X:%02X to queue begin.", MAC2STR(esp_now_info->src_addr));
 #endif
-    if (uxQueueSpacesAvailable(_queue_handle) < (_init_config.queue_size - 2))
+    if (uxQueueSpacesAvailable(_queue_handle) < (_init_config.queue_size / 2))
     {
         ESP_LOGW(TAG, "Adding incoming ESP-NOW data to queue fail. Queue is almost full.");
         return;
